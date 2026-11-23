@@ -1,0 +1,165 @@
+---
+title: "Final Project - Forecasting US Candy Production"
+author: "brp107@scarletmail.rutgers.edu"
+date: "11/23/2026"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(fpp2)
+library(forecast)
+
+candy <- read.csv("candy.csv")
+candy_ts <- ts(candy$IPG3113N, start = c(1972, 1), frequency = 12)
+```
+
+## 1. Exploration
+
+```{r}
+summary(candy_ts)
+plot(candy_ts, main = "US Candy Production Index (IPG3113N)", ylab = "Index")
+lines(ma(candy_ts, order = 12), col = "red", lwd = 2)
+
+Acf(candy_ts, lag.max = 48)
+monthplot(candy_ts, ylab = "Index")
+round(tapply(candy_ts, cycle(candy_ts), mean), 1)
+
+ndiffs(candy_ts)
+nsdiffs(candy_ts)
+ndiffs(diff(candy_ts, 12))
+tsdisplay(diff(candy_ts, 12))
+
+stl_decomp <- stl(candy_ts, s.window = "periodic")
+plot(stl_decomp)
+round(window(stl_decomp$time.series[, "trend"], start = c(2024, 1)), 1)
+```
+
+**Insights:** the series has a strong yearly cycle (ACF of 0.89 at lag 12 and 0.83 at lag 24; production is about 26 index points higher in Oct–Dec than in Apr–Jul) and a long-run trend that rose until 2000, fell in 2008–09 and recovered. One seasonal difference makes it stationary (`nsdiffs` = 1, then `ndiffs` = 0). The STL trend peaked at about 100.5 in early 2025 and has fallen every month since, to 85.2 in August 2026. Jan–Aug 2026 output was 14% below Jan–Aug 2025.
+
+## 2. Train / test split
+
+```{r}
+train <- window(candy_ts, end = c(2024, 8))
+test  <- window(candy_ts, start = c(2024, 9))
+h <- length(test)
+```
+
+The models are fit on Jan 1972 – Aug 2024 (632 months) and tested on Sep 2024 – Aug 2026 (24 months, two full seasonal cycles).
+
+## 3. Models
+
+```{r}
+snaive_forecast <- snaive(train, h = h)
+
+HW_model    <- HoltWinters(train)
+c(HW_model$alpha, HW_model$beta, HW_model$gamma)
+HW_forecast <- forecast(HW_model, h = h)
+
+ets_model    <- ets(train)
+ets_model
+ets_forecast <- forecast(ets_model, h = h)
+
+stl_forecast <- stlf(train, h = h)
+stl_forecast$model$method
+
+arima_model    <- auto.arima(train, stepwise = FALSE, approximation = FALSE)
+arima_model
+arima_forecast <- forecast(arima_model, h = h)
+
+reg_model    <- tslm(train ~ trend + season)
+summary(reg_model)$r.squared
+reg_forecast <- forecast(reg_model, h = h)
+```
+
+## 4. Forecasts vs actual on the test set
+
+```{r}
+plot(test, ylim = c(70, 125), lwd = 3, main = "24-month forecasts vs actual", ylab = "Index")
+lines(snaive_forecast$mean, col = "blue")
+lines(HW_forecast$mean, col = "red")
+lines(ets_forecast$mean, col = "green")
+lines(stl_forecast$mean, col = "purple")
+lines(arima_forecast$mean, col = "orange", lwd = 2)
+lines(reg_forecast$mean, col = "cyan")
+legend("bottomleft", legend = c("Actual", "Seasonal naive", "Holt-Winters", "ETS",
+                                "STL + ETS", "ARIMA", "Regression"),
+       col = c("black", "blue", "red", "green", "purple", "orange", "cyan"),
+       lwd = 2, bty = "n", cex = 0.8)
+```
+
+## 5. Accuracy
+
+RMSE is the selection measure: it is in index points, like the data, and it penalizes large misses, which are the costly ones for production planning. MAPE is shown as a percentage for management.
+
+```{r}
+acc_table <- rbind(
+  "Seasonal naive" = accuracy(snaive_forecast, test)["Test set", c("RMSE", "MAE", "MAPE", "MASE")],
+  "Holt-Winters"   = accuracy(HW_forecast, test)["Test set", c("RMSE", "MAE", "MAPE", "MASE")],
+  "ETS"            = accuracy(ets_forecast, test)["Test set", c("RMSE", "MAE", "MAPE", "MASE")],
+  "STL + ETS"      = accuracy(stl_forecast, test)["Test set", c("RMSE", "MAE", "MAPE", "MASE")],
+  "ARIMA"          = accuracy(arima_forecast, test)["Test set", c("RMSE", "MAE", "MAPE", "MASE")],
+  "Regression"     = accuracy(reg_forecast, test)["Test set", c("RMSE", "MAE", "MAPE", "MASE")]
+)
+round(acc_table, 2)
+```
+
+One 24-month test is dominated by the 2026 drop, so each model is also tested on ten separate years: train through August of year *k*, forecast the next 12 months, for *k* = 2016 to 2025.
+
+```{r, warning=FALSE}
+rolling <- NULL
+for (k in 2016:2025) {
+  tr <- window(candy_ts, end = c(k, 8))
+  te <- window(candy_ts, start = c(k, 9), end = c(k + 1, 8))
+  f <- list(
+    "Seasonal naive" = snaive(tr, h = 12)$mean,
+    "Holt-Winters"   = forecast(HoltWinters(tr), h = 12)$mean,
+    "ETS"            = forecast(ets(tr), h = 12)$mean,
+    "STL + ETS"      = stlf(tr, h = 12)$mean,
+    "ARIMA"          = forecast(auto.arima(tr), h = 12)$mean,
+    "Regression"     = forecast(tslm(tr ~ trend + season), h = 12)$mean
+  )
+  rolling <- rbind(rolling, sapply(f, function(p) sqrt(mean((as.numeric(te) - as.numeric(p))^2))))
+}
+rownames(rolling) <- paste0(2016:2025, "-", 2017:2026)
+round(rolling, 2)
+round(colMeans(rolling), 2)
+```
+
+## 6. Residual analysis
+
+```{r, fig.height=8}
+par(mfrow = c(2, 3))
+Acf(residuals(snaive_forecast), main = "Seasonal naive")
+Acf(residuals(HW_forecast), main = "Holt-Winters")
+Acf(residuals(ets_forecast), main = "ETS")
+Acf(residuals(stl_forecast), main = "STL + ETS")
+Acf(residuals(arima_forecast), main = "ARIMA")
+Acf(residuals(reg_forecast), main = "Regression")
+par(mfrow = c(1, 1))
+
+Box.test(residuals(snaive_forecast), lag = 24, type = "Ljung")
+Box.test(residuals(HW_forecast), lag = 24, type = "Ljung", fitdf = 3)
+Box.test(residuals(ets_forecast), lag = 24, type = "Ljung", fitdf = 2)
+Box.test(residuals(stl_forecast), lag = 24, type = "Ljung", fitdf = 1)
+Box.test(residuals(arima_forecast), lag = 24, type = "Ljung", fitdf = 5)
+Box.test(residuals(reg_forecast), lag = 24, type = "Ljung")
+```
+
+## 7. Final model and forecast
+
+```{r}
+final_fit <- auto.arima(candy_ts, stepwise = FALSE, approximation = FALSE)
+final_fit
+checkresiduals(final_fit)
+
+final_forecast <- forecast(final_fit, h = 12)
+final_forecast
+plot(final_forecast, include = 48, main = "ARIMA forecast, Sep 2026 - Aug 2027", ylab = "Index")
+
+mean(final_forecast$mean)
+mean(window(candy_ts, start = c(2025, 9)))
+mean(window(final_forecast$mean, start = c(2026, 10), end = c(2026, 12)))
+mean(window(candy_ts, start = c(2025, 10), end = c(2025, 12)))
+```
+
+**Conclusion:** ARIMA(3,0,0)(1,1,1)[12] has the lowest average error across the ten one-year tests (RMSE 5.95) and the cleanest residuals of the six models. It forecasts an average index of 84.3 for Sep 2026 – Aug 2027, 4.8% below the last 12 months, with an Oct–Dec 2026 holiday peak averaging 93.2, down 8% from 2025.
